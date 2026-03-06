@@ -8,7 +8,6 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 )
 
-/* Allow GitHub Pages to call this API */
 const corsHeaders = {
   "Access-Control-Allow-Origin": "https://machadosirrigation.github.io",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -23,13 +22,13 @@ export async function POST(req: Request) {
   try {
     const body = await req.json()
 
-    const name = body.name?.trim()
-    const phone = body.phone?.trim()
-    const email = body.email?.trim()
-    const address = body.address?.trim()
-    const serviceType = body.serviceType?.trim()
-    const message = body.message?.trim()
-    const preferredDate = body.preferredDate || null
+    const name = String(body.name ?? "").trim()
+    const phone = String(body.phone ?? "").trim()
+    const email = String(body.email ?? "").trim()
+    const address = String(body.address ?? "").trim()
+    const serviceType = String(body.serviceType ?? "").trim()
+    const message = String(body.message ?? "").trim()
+    const preferredDate = body.preferredDate ? String(body.preferredDate) : null
 
     if (!name || !phone || !serviceType) {
       return NextResponse.json(
@@ -38,31 +37,67 @@ export async function POST(req: Request) {
       )
     }
 
-    /* -------------------------------- */
-    /* Find existing client */
-    /* -------------------------------- */
+    // --------------------------------
+    // 1) Find a company owner user_id
+    // --------------------------------
+    const { data: ownerRow, error: ownerError } = await supabase
+      .from("company_members")
+      .select("user_id")
+      .eq("company_id", ORG_ID)
+      .eq("role", "owner")
+      .limit(1)
+      .maybeSingle()
 
+    if (ownerError) {
+      return NextResponse.json(
+        { error: `Owner lookup failed: ${ownerError.message}` },
+        { status: 500, headers: corsHeaders }
+      )
+    }
+
+    if (!ownerRow?.user_id) {
+      return NextResponse.json(
+        { error: "No company owner found for this org." },
+        { status: 500, headers: corsHeaders }
+      )
+    }
+
+    const ownerUserId = ownerRow.user_id
+
+    // --------------------------------
+    // 2) Find existing client
+    // --------------------------------
     let clientId: string | null = null
 
     if (email || phone) {
-      const { data } = await supabase
+      const filters: string[] = []
+      if (email) filters.push(`email.eq.${email}`)
+      if (phone) filters.push(`phone.eq.${phone}`)
+
+      const { data: existingClients, error: existingClientError } = await supabase
         .from("clients")
         .select("id")
         .eq("company_id", ORG_ID)
-        .or(`email.eq.${email},phone.eq.${phone}`)
+        .or(filters.join(","))
         .limit(1)
 
-      if (data && data.length > 0) {
-        clientId = data[0].id
+      if (existingClientError) {
+        return NextResponse.json(
+          { error: `Client lookup failed: ${existingClientError.message}` },
+          { status: 500, headers: corsHeaders }
+        )
+      }
+
+      if (existingClients && existingClients.length > 0) {
+        clientId = existingClients[0].id
       }
     }
 
-    /* -------------------------------- */
-    /* Create client if none exists */
-    /* -------------------------------- */
-
+    // --------------------------------
+    // 3) Create client if needed
+    // --------------------------------
     if (!clientId) {
-      const { data, error } = await supabase
+      const { data: newClient, error: newClientError } = await supabase
         .from("clients")
         .insert([
           {
@@ -76,21 +111,20 @@ export async function POST(req: Request) {
         .select("id")
         .single()
 
-      if (error) {
+      if (newClientError) {
         return NextResponse.json(
-          { error: error.message },
+          { error: `Client create failed: ${newClientError.message}` },
           { status: 500, headers: corsHeaders }
         )
       }
 
-      clientId = data.id
+      clientId = newClient.id
     }
 
-    /* -------------------------------- */
-    /* Create lead */
-    /* -------------------------------- */
-
-    const { data: leadData, error: leadError } = await supabase
+    // --------------------------------
+    // 4) Create lead
+    // --------------------------------
+    const { data: leadRow, error: leadError } = await supabase
       .from("leads")
       .insert([
         {
@@ -99,6 +133,8 @@ export async function POST(req: Request) {
           status: "New",
           job_type: serviceType,
           description: message || null,
+          customer_id: null,
+          property_id: null,
         },
       ])
       .select("id")
@@ -106,22 +142,22 @@ export async function POST(req: Request) {
 
     if (leadError) {
       return NextResponse.json(
-        { error: leadError.message },
+        { error: `Lead create failed: ${leadError.message}` },
         { status: 500, headers: corsHeaders }
       )
     }
 
-    /* -------------------------------- */
-    /* Create job draft */
-    /* -------------------------------- */
-
-    const { data: jobData, error: jobError } = await supabase
+    // --------------------------------
+    // 5) Create job
+    // --------------------------------
+    const { data: jobRow, error: jobError } = await supabase
       .from("jobs")
       .insert([
         {
           company_id: ORG_ID,
+          user_id: ownerUserId,
           client_id: clientId,
-          title: serviceType,
+          title: serviceType || "Website Request",
           status: "Scheduled",
           scheduled_for: preferredDate || null,
           price: 0,
@@ -132,30 +168,29 @@ export async function POST(req: Request) {
 
     if (jobError) {
       return NextResponse.json(
-        { error: jobError.message },
+        { error: `Job create failed: ${jobError.message}` },
         { status: 500, headers: corsHeaders }
       )
     }
 
-    /* -------------------------------- */
-    /* Mark lead converted */
-    /* -------------------------------- */
-
+    // --------------------------------
+    // 6) Mark lead converted
+    // --------------------------------
     await supabase
       .from("leads")
       .update({ status: "Converted" })
-      .eq("id", leadData.id)
+      .eq("id", leadRow.id)
 
     return NextResponse.json(
       {
         success: true,
-        leadId: leadData.id,
+        leadId: leadRow.id,
         clientId,
-        jobId: jobData.id,
+        jobId: jobRow.id,
       },
       { headers: corsHeaders }
     )
-  } catch {
+  } catch (error) {
     return NextResponse.json(
       { error: "Invalid request." },
       { status: 400, headers: corsHeaders }
